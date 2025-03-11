@@ -1,15 +1,19 @@
 use core::traits::Into;
+use core::num::traits::Bounded;
 use starknet::{ContractAddress, contract_address_const};
 use snforge_std::{
     declare, ContractClassTrait, DeclareResultTrait, start_cheat_caller_address,
     stop_cheat_caller_address, start_cheat_block_timestamp, stop_cheat_block_timestamp,
+    generate_random_felt,
 };
 use fundable::interfaces::IDistributor::{IDistributorDispatcher, IDistributorDispatcherTrait};
+//use fundable::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
 use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
 use fundable::base::types::{
     DistributionHistory, Distribution, WeightedDistribution, TokenStats, UserStats,
 };
 
+const U16_MAX: u16 = Bounded::<u16>::MAX;
 
 fn setup() -> (ContractAddress, ContractAddress, IDistributorDispatcher) {
     let sender: ContractAddress = contract_address_const::<'sender'>();
@@ -26,6 +30,599 @@ fn setup() -> (ContractAddress, ContractAddress, IDistributorDispatcher) {
         .unwrap();
 
     (erc20_address, sender, IDistributorDispatcher { contract_address: distributor_address })
+}
+
+fn top_tokens_mainnet() -> Array<(ContractAddress, ContractAddress, u256)> {
+    array![
+        (
+            contract_address_const::<
+                0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7,
+            >(),
+            contract_address_const::<
+                0x0213c67ed78bc280887234fe5ed5e77272465317978ae86c25a71531d9332a2d,
+            >(),
+            54232_u256,
+        ), // 160 * 331, ETH highest_holder -> 0x0213c67ed78bc280887234fe5ed5e77272465317978ae86c25a71531d9332a2d
+        (
+            contract_address_const::<
+                0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8,
+            >(),
+            contract_address_const::<
+                0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b,
+            >(),
+            19836339_u256,
+        ), // 59928 * 331, USDC highest_holder -> 0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b
+        (
+            contract_address_const::<
+                0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d,
+            >(),
+            contract_address_const::<
+                0x00ca1702e64c81d9a07b86bd2c540188d92a2c73cf5cc0e508d949015e7e84a7,
+            >(),
+            184313527_u256,
+        ), // 556838 * 331, STRK highest_holder -> 0x00ca1702e64c81d9a07b86bd2c540188d92a2c73cf5cc0e508d949015e7e84a7
+        (
+            contract_address_const::<
+                0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8,
+            >(),
+            contract_address_const::<
+                0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b,
+            >(),
+            9312882_u256,
+        ) // 28135 * 331, USDT highest_holder -> 0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b
+    ]
+}
+
+fn base_address() -> felt252 {
+    0x02bbab4d3c77dd83dfe47af99c9a3188a660e9c652a2f7af3d21df213f4882cd
+}
+
+// Recipients exceeding 331 results in a failure.
+// Failure data:
+//     Got an exception while executing a hint: Hint Error: Error at pc=0:8539:
+//     Got an exception while executing a hint: Exceeded the maximum number of events, number
+//     events: 1001, max number events: 1000.
+//     Cairo traceback (most recent call last):
+//     Unknown location (pc=0:8553)
+fn recipients_array(
+    recipients_count: u16, token: IERC20Dispatcher,
+) -> (Array<ContractAddress>, Array<u256>) {
+    let base_address: felt252 = base_address();
+
+    let recipients_count = if recipients_count == 0 || recipients_count > 331 {
+        331
+    } else {
+        recipients_count
+    };
+
+    let mut recipients: Array<ContractAddress> = ArrayTrait::new();
+    let mut recipients_initial_balances: Array<u256> = ArrayTrait::new();
+
+    for i in 0..recipients_count {
+        let current_address: ContractAddress = (base_address + i.into()).try_into().unwrap();
+        recipients.append(current_address);
+        recipients_initial_balances.append(token.balance_of(current_address));
+    };
+
+    (recipients, recipients_initial_balances)
+}
+
+// Assert Eq macro is used here to pass error messages with context(recipient address)
+fn assert_balances(
+    recipients: Span<ContractAddress>,
+    recipients_initial_balances: Span<u256>,
+    token: IERC20Dispatcher,
+    amount_per_recipient: u256,
+) {
+    for i in 0..recipients.len() {
+        assert_eq!(
+            token.balance_of(*recipients.at(i.into())),
+            amount_per_recipient + *recipients_initial_balances.at(i.into()),
+            "Wrong balance for recipient: {:?}",
+            *recipients.at(i.into()),
+        );
+    };
+}
+
+fn assert_weighted_balances(
+    recipients: Span<ContractAddress>,
+    recipients_initial_balances: Span<u256>,
+    token: IERC20Dispatcher,
+    amount_per_recipient: Span<u256>,
+) {
+    for i in 0..recipients.len() {
+        assert_eq!(
+            token.balance_of(*recipients.at(i.into())),
+            *amount_per_recipient.at(i.into()) + *recipients_initial_balances.at(i.into()),
+            "Wrong balance for recipient: {:?}",
+            *recipients.at(i.into()),
+        );
+    };
+}
+
+// Fuzzer could fuzz 0 value which would error.
+// If amount is zero, set to max to avoid transfer errors.
+fn gen_amount_per_recipient(amount_per_recipient: u256) -> u256 {
+    if amount_per_recipient == 0 {
+        (U16_MAX).into()
+    } else {
+        amount_per_recipient
+    }
+}
+
+// U16 is used to avoid 'Add Overflow' errors.
+fn gen_weighted_amounts(weight: u32) -> Array<u256> {
+    let mut weighted_amounts = ArrayTrait::new();
+    for _ in 0..weight {
+        // 65,535 * 331 < U256_MAX
+        let max_16: u256 = U16_MAX.into();
+        let amount: u256 = generate_random_felt().into();
+        let amount = if amount == 0 || amount > max_16 {
+            max_16
+        } else {
+            amount
+        };
+        weighted_amounts.append(amount);
+    };
+    weighted_amounts
+}
+
+// This would not be needed when this issue is resolved
+// `https://github.com/foundry-rs/starknet-foundry/issues/1979`
+// `mint cheatcode for testing purposes`
+fn gen_based_weighted_amounts(weight: u32, max_check: u256) -> Array<u256> {
+    let mut weighted_amounts = ArrayTrait::new();
+    for _ in 0..weight {
+        // allowance * 331 <= max_check
+        let maxi: u256 = max_check / weight.into();
+        let amount: u256 = generate_random_felt().into();
+        let amount = if amount == 0 || amount > maxi {
+            maxi
+        } else {
+            amount
+        };
+        weighted_amounts.append(amount);
+    };
+    weighted_amounts
+}
+
+// Test Cases (Distribute, DistributeWeighted)
+// Fuzz recipients array
+#[test]
+fn test_fuzz_recipients(recipients_count: u16) {
+    let (token_address, sender, distributor) = setup();
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Calculate and approve the amount each recipient will receive, ensuring the sender has
+    // sufficient balance for all 'transfer_from' calls.
+    let balance = token.balance_of(sender);
+    let amount_per_recipient = balance / recipients.len().into();
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, balance);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz amount per recipient
+#[test]
+fn test_fuzz_amount_per_recipient(amount_per_recipient: u16) {
+    let (token_address, sender, distributor) = setup();
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(331, token);
+
+    // Avoid zero transfer errors.
+    let amount_per_recipient: u256 = gen_amount_per_recipient(amount_per_recipient.into());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, token.balance_of(sender));
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz Both amount and recipients
+#[test]
+fn test_fuzz_both_amount_and_recipients(recipients_count: u16, amount_per_recipient: u16) {
+    let (token_address, sender, distributor) = setup();
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Avoid zero transfer errors.
+    let amount_per_recipient: u256 = gen_amount_per_recipient(amount_per_recipient.into());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, token.balance_of(sender));
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz Weighted amount and recipients
+#[test]
+#[ignore]
+fn test_fuzz_weighted_amount_and_recipients(recipients_count: u16) {
+    let (token_address, sender, distributor) = setup();
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Weighted amounts are generated based on the recipients' weights.
+    let mut weighted_amounts: Array<u256> = gen_weighted_amounts(recipients.len());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, token.balance_of(sender));
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute_weighted(weighted_amounts.clone(), recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_weighted_balances(
+        recipients.span(), recipients_initial_balances.span(), token, weighted_amounts.span(),
+    );
+}
+
+// Fuzz and Fork Mainnet recipients array
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_and_fork_STRK_mainnet_recipients(recipients_count: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(2);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let amount_per_recipient: u256 = U16_MAX.into();
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz and Fork Mainnet amount per recipient
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_and_fork_STRK_mainnet_amount_per_recipient(amount_per_recipient: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(2);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(331, token);
+
+    let amount_per_recipient: u256 = gen_amount_per_recipient(amount_per_recipient.into());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz and Fork Mainnet amount per recipient and recipients array
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_STRK_distribution(recipients_count: u16, amount_per_recipient: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(2);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let amount_per_recipient: u256 = gen_amount_per_recipient(amount_per_recipient.into());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+// Fuzz and Fork Mainnet weighted amount per recipient and recipients array
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_STRK_weighted_distribution(recipients_count: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(2);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let mut weighted_amounts: Array<u256> = gen_weighted_amounts(recipients.len());
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute_weighted(weighted_amounts.clone(), recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_weighted_balances(
+        recipients.span(), recipients_initial_balances.span(), token, weighted_amounts.span(),
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_ETH_distribution(recipients_count: u16, amount_per_recipient: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let token_data = *mainnet_token.at(0);
+    let (token_address, sender, allow) = token_data;
+
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Avoid zero transfer errors.
+    let amount_per_recipient: u256 = 160;
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_ETH_weighted_distribution(recipients_count: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(0);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let mut weighted_amounts: Array<u256> = gen_based_weighted_amounts(recipients.len(), allow);
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute_weighted(weighted_amounts.clone(), recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_weighted_balances(
+        recipients.span(), recipients_initial_balances.span(), token, weighted_amounts.span(),
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_USDC_distribution(recipients_count: u16, amount_per_recipient: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let token_data = *mainnet_token.at(1);
+    let (token_address, sender, allow) = token_data;
+
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Avoid zero transfer errors.
+    let amount_per_recipient: u256 = 59928;
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_USDC_weighted_distribution(recipients_count: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(1);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let mut weighted_amounts: Array<u256> = gen_based_weighted_amounts(recipients.len(), allow);
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute_weighted(weighted_amounts.clone(), recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_weighted_balances(
+        recipients.span(), recipients_initial_balances.span(), token, weighted_amounts.span(),
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_USDT_distribution(recipients_count: u16, amount_per_recipient: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let token_data = *mainnet_token.at(3);
+    let (token_address, sender, allow) = token_data;
+
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Fuzz recipients array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    // Avoid zero transfer errors.
+    let amount_per_recipient: u256 = 28135;
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute(amount_per_recipient, recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_balances(
+        recipients.span(), recipients_initial_balances.span(), token, amount_per_recipient,
+    );
+}
+
+#[test]
+#[ignore]
+#[fork("MAINNET")]
+fn test_fuzz_fork_USDT_weighted_distribution(recipients_count: u16) {
+    let (_, _, distributor) = setup();
+
+    let mainnet_token = top_tokens_mainnet();
+    let (token_address, sender, allow) = *mainnet_token.at(3);
+    let token = IERC20Dispatcher { contract_address: token_address };
+
+    // Recipients, Recipients initial balances array
+    let (recipients, recipients_initial_balances) = recipients_array(recipients_count, token);
+
+    let mut weighted_amounts: Array<u256> = gen_based_weighted_amounts(recipients.len(), allow);
+
+    // Approve tokens for distributor
+    start_cheat_caller_address(token_address, sender);
+    token.approve(distributor.contract_address, allow);
+    stop_cheat_caller_address(token_address);
+
+    // Distribute tokens
+    start_cheat_caller_address(distributor.contract_address, sender);
+    distributor.distribute_weighted(weighted_amounts.clone(), recipients.clone(), token_address);
+    stop_cheat_caller_address(distributor.contract_address);
+
+    // Assert balances
+    assert_weighted_balances(
+        recipients.span(), recipients_initial_balances.span(), token, weighted_amounts.span(),
+    );
 }
 
 #[test]

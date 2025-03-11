@@ -1,14 +1,18 @@
 #[starknet::contract]
 mod PaymentStream {
-    use starknet::{get_caller_address, get_contract_address, storage::Map, storage::Vec};
+    use starknet::{
+        get_caller_address, get_contract_address, get_block_timestamp, storage::Map, storage::Vec,
+        storage::VecTrait, storage::MutableVecTrait, storage::StoragePointerWriteAccess,
+        storage::StoragePointerReadAccess, storage::StoragePathEntry,
+    };
+    use starknet::{ContractAddress, contract_address_const};
     use core::traits::Into;
     use core::num::traits::Zero;
-    use starknet::ContractAddress;
     use crate::base::types::{Stream, StreamStatus, StreamMetrics, ProtocolMetrics};
     use fundable::interfaces::IPaymentStream::IPaymentStream;
     use crate::base::errors::Errors::{
         ZERO_AMOUNT, INVALID_TOKEN, UNEXISTING_STREAM, WRONG_RECIPIENT, WRONG_SENDER,
-        INVALID_RECIPIENT, END_BEFORE_START, INSUFFICIENT_ALLOWANCE,
+        INVALID_RECIPIENT, END_BEFORE_START, INSUFFICIENT_ALLOWANCE, WRONG_RECIPIENT_OR_DELEGATE,
     };
     use openzeppelin::access::accesscontrol::AccessControlComponent;
     use openzeppelin::introspection::src5::SRC5Component;
@@ -49,6 +53,7 @@ mod PaymentStream {
     #[event]
     #[derive(Drop, starknet::Event)]
     enum Event {
+        StreamRateUpdated: StreamRateUpdated,
         StreamCreated: StreamCreated,
         StreamWithdrawn: StreamWithdrawn,
         StreamCanceled: StreamCanceled,
@@ -61,6 +66,17 @@ mod PaymentStream {
         Src5Event: SRC5Component::Event,
         #[flat]
         AccessControlEvent: AccessControlComponent::Event,
+        DelegationGranted: DelegationGranted,
+        DelegationRevoked: DelegationRevoked,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct StreamRateUpdated {
+        #[key]
+        stream_id: u256,
+        old_rate: u256,
+        new_rate: u256,
+        update_time: u64,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -173,7 +189,6 @@ mod PaymentStream {
         /// @notice points basis: 100pbs = 1%
         fn calculate_protocol_fee(self: @ContractState, total_amount: u256) -> u256 {
             let protocol_fee_percentage = self.protocol_fee_percentage.read();
-            assert(protocol_fee_percentage > 0, 'Zero protocol fee');
             let fee = (total_amount * protocol_fee_percentage.into()) / 10000;
             fee
         }
@@ -185,6 +200,15 @@ mod PaymentStream {
             assert(fee_collector.is_non_zero(), INVALID_RECIPIENT);
             IERC20Dispatcher { contract_address: token }
                 .transfer_from(sender, fee_collector, amount);
+        }
+
+        fn assert_is_recipient_or_delegate(self: @ContractState, stream_id: u256) {
+            let stream = self.streams.read(stream_id);
+            let caller = get_caller_address();
+            if caller != stream.recipient {
+                let delegate = self.stream_delegates.read(stream_id);
+                assert(caller == delegate, WRONG_RECIPIENT_OR_DELEGATE);
+            }
         }
     }
 
@@ -254,8 +278,7 @@ mod PaymentStream {
         fn withdraw(
             ref self: ContractState, stream_id: u256, amount: u256, to: ContractAddress,
         ) -> (u128, u128) {
-            self.accesscontrol.assert_only_role(STREAM_ADMIN_ROLE);
-
+            self.assert_is_recipient_or_delegate(stream_id);
             assert(amount > 0, ZERO_AMOUNT);
             assert(to.is_non_zero(), INVALID_RECIPIENT);
 
@@ -287,8 +310,7 @@ mod PaymentStream {
         fn withdraw_max(
             ref self: ContractState, stream_id: u256, to: ContractAddress,
         ) -> (u128, u128) {
-            self.accesscontrol.assert_only_role(STREAM_ADMIN_ROLE);
-
+            self.assert_is_recipient_or_delegate(stream_id);
             assert(to.is_non_zero(), INVALID_RECIPIENT);
 
             let stream = self.streams.read(stream_id);
@@ -303,7 +325,8 @@ mod PaymentStream {
             let fee_into_u128 = fee.try_into().unwrap();
             let net_amount_into_u128 = net_amount.try_into().unwrap();
 
-            token_dispatcher.transfer_from(sender, to, net_amount);
+            token_dispatcher
+                .transfer_from(sender, to, net_amount); // todo: check if this is correct
             self.collect_protocol_fee(sender, token_address, fee);
 
             self
@@ -344,6 +367,8 @@ mod PaymentStream {
             assert(recipient.is_non_zero(), INVALID_RECIPIENT);
 
             let fee_collector = self.fee_collector.read();
+
+            assert(fee_collector.is_non_zero(), INVALID_RECIPIENT);
 
             let max_amount = IERC20Dispatcher { contract_address: token }.balance_of(fee_collector);
 
@@ -396,22 +421,70 @@ mod PaymentStream {
             self.fee_collector.read()
         }
 
-        fn cancel(ref self: ContractState, stream_id: u256) { // Empty implementation
-        // todo!()
+        fn cancel(ref self: ContractState, stream_id: u256) {
+            // Ensure the caller has the STREAM_ADMIN_ROLE
+            self.accesscontrol.assert_only_role(STREAM_ADMIN_ROLE);
+
+            // Retrieve the stream
+            let mut stream = self.streams.read(stream_id);
+
+            // Ensure the stream is active before cancellation
+            self.assert_stream_exists(stream_id);
+            assert(stream.status == StreamStatus::Active, 'Stream is not Active');
+            // Update the stream status to canceled
+            stream.status = StreamStatus::Canceled;
+
+            // Update the stream end time
+            stream.end_time = get_block_timestamp();
+
+            // Handle refunding unclaimed funds
+            let recipient = get_caller_address();
+            if stream.total_amount > 0 {
+                self.withdraw_max(stream_id, recipient);
+            }
+
+            // Emit an event for stream cancellation
+            self.emit(StreamCanceled { stream_id });
+
+            // Update Stream in State
+            self.streams.write(stream_id, stream);
         }
 
-        fn pause(ref self: ContractState, stream_id: u256) { // Empty implementation
-        // todo!()
+        fn pause(ref self: ContractState, stream_id: u256) {
+            let mut stream = self.streams.read(stream_id);
+
+            self.assert_stream_exists(stream_id);
+            assert(stream.status != StreamStatus::Canceled, 'Stream is not active');
+
+            stream.status = StreamStatus::Paused;
+            self.streams.write(stream_id, stream);
+
+            self.emit(StreamPaused { stream_id, pause_time: starknet::get_block_timestamp() });
         }
 
-        fn restart(
-            ref self: ContractState, stream_id: u256, rate_per_second: u256,
-        ) { // Empty implementation
-        //  todo!()
+        fn restart(ref self: ContractState, stream_id: u256, rate_per_second: u256) {
+            let mut stream = self.streams.read(stream_id);
+
+            self.assert_stream_exists(stream_id);
+            assert(stream.status != StreamStatus::Canceled, 'Stream is not active');
+
+            stream.status = StreamStatus::Active;
+            stream.rate_per_second = rate_per_second;
+            self.streams.write(stream_id, stream);
+
+            self.emit(StreamRestarted { stream_id, rate_per_second });
         }
 
-        fn void(ref self: ContractState, stream_id: u256) { // Empty implementation
-        //  todo!()
+        fn void(ref self: ContractState, stream_id: u256) {
+            let mut stream = self.streams.read(stream_id);
+
+            self.assert_stream_exists(stream_id);
+            assert(stream.status != StreamStatus::Canceled, 'Stream is not active');
+
+            stream.status = StreamStatus::Voided;
+            self.streams.write(stream_id, stream);
+
+            self.emit(StreamVoided { stream_id });
         }
 
         fn get_stream(self: @ContractState, stream_id: u256) -> Stream {
@@ -440,7 +513,13 @@ mod PaymentStream {
 
         fn is_stream_active(self: @ContractState, stream_id: u256) -> bool {
             // Return dummy status
-            false
+            let mut stream = self.streams.read(stream_id);
+
+            if (stream.status == StreamStatus::Active) {
+                return true;
+            } else {
+                return false;
+            }
         }
 
         fn get_depletion_time(self: @ContractState, stream_id: u256) -> u64 {
@@ -483,5 +562,70 @@ mod PaymentStream {
         fn get_protocol_metrics(self: @ContractState) -> ProtocolMetrics {
             self.protocol_metrics.read()
         }
+
+        fn delegate_stream(
+            ref self: ContractState, stream_id: u256, delegate: ContractAddress,
+        ) -> bool {
+            self.assert_stream_exists(stream_id);
+            self.assert_is_sender(stream_id);
+            assert(delegate.is_non_zero(), INVALID_RECIPIENT);
+            self.stream_delegates.write(stream_id, delegate);
+            self.delegation_history.entry(stream_id).append().write(delegate);
+            self.emit(DelegationGranted { stream_id, delegator: get_caller_address(), delegate });
+            true
+        }
+
+        fn revoke_delegation(ref self: ContractState, stream_id: u256) -> bool {
+            self.assert_stream_exists(stream_id);
+            self.assert_is_sender(stream_id);
+            let delegate = self.stream_delegates.read(stream_id);
+            assert(delegate.is_non_zero(), UNEXISTING_STREAM);
+            self.stream_delegates.write(stream_id, contract_address_const::<0x0>());
+            self.emit(DelegationRevoked { stream_id, delegator: get_caller_address(), delegate });
+            true
+        }
+
+        fn get_stream_delegate(self: @ContractState, stream_id: u256) -> ContractAddress {
+            self.stream_delegates.read(stream_id)
+        }
+
+        fn update_stream_rate(ref self: ContractState, stream_id: u256, new_rate_per_second: u256) {
+            let caller = get_caller_address();
+            assert!(new_rate_per_second > 0, "Rate must be greater than 0");
+            assert!(
+                self.streams.read(stream_id).sender == caller, "Only stream owner can update rate",
+            );
+
+            let stream: Stream = self.streams.read(stream_id);
+            assert!(stream.status == StreamStatus::Active, "Stream is not active");
+
+            let new_stream = Stream {
+                rate_per_second: new_rate_per_second,
+                sender: stream.sender,
+                recipient: stream.recipient,
+                token: stream.token,
+                total_amount: stream.total_amount,
+                start_time: stream.start_time,
+                end_time: stream.end_time,
+                withdrawn_amount: stream.withdrawn_amount,
+                cancelable: stream.cancelable,
+                status: stream.status,
+                last_update_time: starknet::get_block_timestamp(),
+            };
+
+            self.streams.write(stream_id, new_stream);
+            self
+                .emit(
+                    Event::StreamRateUpdated(
+                        StreamRateUpdated {
+                            stream_id,
+                            old_rate: stream.rate_per_second,
+                            new_rate: new_rate_per_second,
+                            update_time: starknet::get_block_timestamp(),
+                        },
+                    ),
+                );
+        }
     }
 }
+

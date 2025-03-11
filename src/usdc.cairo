@@ -49,7 +49,7 @@ pub mod MockUsdc {
         self.erc20.initializer(format!("USDC"), format!("USDC"));
         self.ownable.initializer(owner);
 
-        self.erc20.mint(recipient, 1000000000000000000000000000);
+        self.erc20.mint(recipient, core::num::traits::Bounded::<u256>::MAX);
     }
 
     #[abi(embed_v0)]

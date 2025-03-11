@@ -1,7 +1,6 @@
 /// Main contract implementation
 #[starknet::contract]
 mod Distributor {
-    use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
     use openzeppelin::upgrades::UpgradeableComponent;
     use openzeppelin::upgrades::interface::IUpgradeable;
     use openzeppelin::access::ownable::OwnableComponent;
@@ -13,6 +12,7 @@ mod Distributor {
     use crate::base::types::{
         DistributionHistory, Distribution, WeightedDistribution, TokenStats, UserStats,
     };
+    use crate::interfaces::IERC20::{IERC20Dispatcher, IERC20DispatcherTrait};
     //  use super::Errors;
     use crate::base::errors::Errors::{
         EMPTY_RECIPIENTS, ZERO_AMOUNT, INSUFFICIENT_ALLOWANCE, INVALID_TOKEN, ARRAY_LEN_MISMATCH,
@@ -114,6 +114,12 @@ mod Distributor {
             let protocol_fee = (*total_amount * fee_percent) / 10000;
             protocol_fee
         }
+        fn validate_token(self: @ContractState, token: ContractAddress) {
+            assert(!token.is_zero(), INVALID_TOKEN);
+            let token_dispatcher = IERC20Dispatcher { contract_address: token };
+            let token_decimals = token_dispatcher.decimals();
+            assert(token_decimals > 0, 'INVALID_TOKEN_DECIMALS');
+        }
     }
 
     #[abi(embed_v0)]
@@ -127,7 +133,7 @@ mod Distributor {
             // Validate inputs
             assert(!recipients.is_empty(), EMPTY_RECIPIENTS);
             assert(amount > 0, ZERO_AMOUNT);
-            assert(!token.is_zero(), INVALID_TOKEN);
+            self.validate_token(token);
 
             // Initialize the dispatcher
             let token_dispatcher = IERC20Dispatcher { contract_address: token };
@@ -193,7 +199,7 @@ mod Distributor {
             // Validate inputs
             assert(!recipients.is_empty(), EMPTY_RECIPIENTS);
             assert(amounts.len() == recipients.len(), ARRAY_LEN_MISMATCH);
-            assert(!token.is_zero(), INVALID_TOKEN);
+            self.validate_token(token);
 
             let caller = get_caller_address();
             let contract_address = get_contract_address();

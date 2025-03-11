@@ -41,7 +41,7 @@ pub struct WeightedDistribution {
 }
 
 /// @notice Enum representing the possible states of a stream
-#[derive(Drop, Serde, starknet::Store)]
+#[derive(Drop, Serde, starknet::Store, PartialEq)]
 #[allow(starknet::store_no_default_variant)]
 pub enum StreamStatus {
     Active, // Stream is actively streaming tokens

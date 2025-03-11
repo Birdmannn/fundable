@@ -1,8 +1,10 @@
-use starknet::ContractAddress;
+// Event Documentation
 
-/// @title PaymentStream Events
-/// @notice Contains all events emitted by the PaymentStream contract for tracking stream lifecycle
-/// @dev All events use stream_id as an indexed key parameter for efficient filtering
+// These events are designed to track payment stream life cycle.  Let's analyze the structure and implementation of the events;
+
+// Event Structure
+// The events are structured into enum that tracks all the major stream operations as follows;
+
 #[event]
 #[derive(Drop, starknet::Event)]
 enum Event {
@@ -14,14 +16,15 @@ enum Event {
     StreamVoided: StreamVoided,
 }
 
-/// @notice Emitted when a new payment stream is created
-/// @dev Emitted by create_stream() function
-/// @param stream_id Unique identifier for the stream
-/// @param sender Address that created and funded the stream
-/// @param recipient Address that will receive the streamed payments
-/// @param total_amount Total amount of tokens to be streamed
-/// @param token Address of the ERC20 token being streamed
-#[derive(Drop, starknet::Event)]
+// The various event variants link to distinct lifecycle events for streams 
+// while keeping stream_id as the essential indexed parameter.  
+// The design structure facilitates both stream event filtering processes and stream event tracking operations.
+
+// Event Implementation Details
+
+    // 1. StreamCreated Event
+
+    #[derive(Drop, starknet::Event)]
 struct StreamCreated {
     #[key]
     stream_id: u256,
@@ -31,12 +34,10 @@ struct StreamCreated {
     token: ContractAddress,
 }
 
-/// @notice Emitted when tokens are withdrawn from a stream
-/// @dev Emitted by withdraw() and withdraw_max() functions
-/// @param stream_id Unique identifier for the stream
-/// @param recipient Address that received the withdrawn tokens
-/// @param amount Amount of tokens withdrawn
-/// @param protocol_fee Amount of tokens taken as protocol fee
+// The stream creation triggers this event. 
+// Includes all essential stream parameters 
+// The database indexes the event queries through the stream_id parameter for fast retrieval.
+
 #[derive(Drop, starknet::Event)]
 struct StreamWithdrawn {
     #[key]
@@ -46,46 +47,61 @@ struct StreamWithdrawn {
     protocol_fee: u128,
 }
 
-/// @notice Emitted when a stream is canceled by an authorized user
-/// @dev Emitted by cancel() function
-/// @param stream_id Unique identifier for the canceled stream
-/// @param remaining_balance Amount of tokens returned to sender
-#[derive(Drop, starknet::Event)]
-struct StreamCanceled {
-    #[key]
-    stream_id: u256,
-    remaining_balance: u256,
+// Tracks token withdrawals 
+// Includes protocol fee information 
+// Maintains consistent stream_id indexing
+
+// Stream State Change Events
+
+// StreamCanceled: Records stream cancellation with remaining balance 
+// StreamPaused: This records stream pause timing using Unix timestamp values. 
+// StreamRestarted: The stream restart event writes timestamp information in the log format. 
+// StreamVoided: This event enables users to store stream void records which include a reason for the void.
+
+
+/// Evens Emision Patterns
+/// When events are emitted, they follow specific patterns
+
+// Example 1: Creating a stream
+fn create_stream(
+    ref self: ContractState,
+    recipient: ContractAddress,
+    total_amount: u256,
+    start_time: u64,
+    end_time: u64,
+    cancelable: bool,
+    token: ContractAddress,
+) -> u256 {
+    // ... stream creation logic ...
+    
+    // Emit StreamCreated event
+    self.emit(Event::StreamCreated(StreamCreated {
+        stream_id,
+        sender: get_caller_address(),
+        recipient,
+        total_amount,
+        token,
+    }));
+    
+    stream_id
 }
 
-/// @notice Emitted when a stream is paused by an authorized user
-/// @dev Emitted by pause_stream() function
-/// @param stream_id Unique identifier for the paused stream
-/// @param paused_at Unix timestamp when the stream was paused
-#[derive(Drop, starknet::Event)]
-struct StreamPaused {
-    #[key]
+// Example 2: Withdrawing from a stream
+fn withdraw(
+    ref self: ContractState,
     stream_id: u256,
-    paused_at: u64,
-}
-
-/// @notice Emitted when a paused stream is restarted
-/// @dev Emitted by restart_stream() function
-/// @param stream_id Unique identifier for the restarted stream
-/// @param restarted_at Unix timestamp when the stream was restarted
-#[derive(Drop, starknet::Event)]
-struct StreamRestarted {
-    #[key]
-    stream_id: u256,
-    restarted_at: u64,
-}
-
-/// @notice Emitted when a stream is permanently voided
-/// @dev Emitted by void_stream() function
-/// @param stream_id Unique identifier for the voided stream
-/// @param void_reason Numeric code indicating the reason for voiding
-#[derive(Drop, starknet::Event)]
-struct StreamVoided {
-    #[key]
-    stream_id: u256,
-    void_reason: u8,
+    amount: u256,
+    to: ContractAddress,
+) -> (u128, u128) {
+    // ... withdrawal logic ...
+    
+    // Emit StreamWithdrawn event
+    self.emit(Event::StreamWithdrawn(StreamWithdrawn {
+        stream_id,
+        recipient: to,
+        amount: net_amount,
+        protocol_fee: fee_into_u128,
+    }));
+    
+    (net_amount_into_u128, fee_into_u128)
 }

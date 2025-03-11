@@ -34,4 +34,8 @@ pub mod Errors {
 
     /// Thrown when a protocol address is not set
     pub const PROTOCOL_FEE_ADDRESS_NOT_SET: felt252 = 'Error: Zero Protocol address';
+
+    /// Thrown when wrong recipient or delegate
+    pub const WRONG_RECIPIENT_OR_DELEGATE: felt252 = 'WRONG_RECIPIENT_OR_DELEGATE';
 }
+
