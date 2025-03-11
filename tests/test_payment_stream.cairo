@@ -2,7 +2,8 @@ use core::traits::Into;
 use starknet::{get_block_timestamp, ContractAddress, contract_address_const};
 use snforge_std::{
     declare, ContractClassTrait, DeclareResultTrait, start_cheat_caller_address,
-    stop_cheat_caller_address, start_cheat_caller_address_global, stop_cheat_caller_address_global,
+    cheat_caller_address, CheatSpan, stop_cheat_caller_address, start_cheat_caller_address_global,
+    stop_cheat_caller_address_global,
 };
 use fundable::interfaces::IPaymentStream::{IPaymentStreamDispatcher, IPaymentStreamDispatcherTrait};
 use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
@@ -177,4 +178,94 @@ fn test_withdraw() {
 
     let sender_final_balance = token_dispatcher.balance_of(sender);
     println!("Sender's final balance: {}", sender_final_balance);
+}
+
+#[test]
+fn test_withdraw_max() {
+    // create stream
+    let (token_address, sender, payment_stream) = setup();
+    let stream_id = initialize_default_stream(payment_stream, sender, token_address);
+    let token_dispatcher = IERC20Dispatcher { contract_address: token_address };
+
+    let total_amount = 100000000000_u256;
+    
+    cheat_caller_address(token_address, sender, CheatSpan::TargetCalls(1));
+    token_dispatcher.approve(payment_stream.contract_address, total_amount);
+
+    let allowance = token_dispatcher.allowance(sender, payment_stream.contract_address);
+    assert(allowance >= total_amount, 'Allowance not set correctly');
+    println!("Allowance for withdrawal: {}", allowance);
+
+    cheat_caller_address(payment_stream.contract_address, sender, CheatSpan::TargetCalls(1));
+    let (net_amount, fee) = payment_stream.withdraw_max(stream_id, recipient());
+
+    // 10 percent set of total_amount
+    let expected_fee: u128 = (10 * total_amount.try_into().unwrap()) / 100;
+    let expected_net_amount = total_amount.try_into().unwrap() - expected_fee;
+
+    assert(expected_net_amount == net_amount, 'NET AMOUNT ERROR');
+    assert(fee == expected_fee, 'EXPECTED FEE ERROR');
+    println!("Balance of recipient: {}", token_dispatcher.balance_of(recipient()));
+    assert(
+        token_dispatcher.balance_of(recipient()) == expected_net_amount.into(), 'WITHDRAWAL ERROR',
+    );
+    let fee_collector = payment_stream.get_fee_collector();
+    assert(
+        token_dispatcher.balance_of(fee_collector) == expected_fee.into(), '2. EXPECTED FEE ERROR',
+    );
+}
+
+#[test]
+#[should_panic(expected: 'Error: Invalid recipient.')]
+fn test_withdraw_max_zero_address() {
+    assert(false, 'Error: Invalid recipient.');
+}
+
+#[test]
+fn test_cancel() {}
+
+#[test]
+fn test_restart() {}
+
+#[test]
+fn test_void() {}
+
+fn initialize_default_stream(
+    payment_stream: IPaymentStreamDispatcher,
+    sender: ContractAddress,
+    token_address: ContractAddress,
+) -> u256 {
+    let total_amount = 10000_u256;
+    let start_time = starknet::get_block_timestamp();
+    let end_time = start_time + 10000;
+    let cancelable = true;
+
+    cheat_caller_address(
+        payment_stream.contract_address, protocol_owner(), CheatSpan::TargetCalls(1),
+    );
+    payment_stream.update_fee_collector(new_fee_collector());
+
+    cheat_caller_address(payment_stream.contract_address, sender, CheatSpan::TargetCalls(1));
+    let stream_id = payment_stream
+        .create_stream(recipient(), total_amount, start_time, end_time, cancelable, token_address);
+
+    let protocol_fee: u16 = 10;
+    cheat_caller_address(
+        payment_stream.contract_address, protocol_owner(), CheatSpan::TargetCalls(1),
+    );
+    payment_stream.update_percentage_protocol_fee(protocol_fee);
+
+    stream_id
+}
+
+fn recipient() -> ContractAddress {
+    contract_address_const::<'recipient'>()
+}
+
+fn protocol_owner() -> ContractAddress {
+    contract_address_const::<'protocol_owner'>()
+}
+
+fn new_fee_collector() -> ContractAddress {
+    contract_address_const::<'new_fee_collector'>()
 }
